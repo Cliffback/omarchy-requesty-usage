@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# omarchy:summary=Refresh the Requesty usage record for the agents panel
+# omarchy:args=[--force] [--resolve]
+# omarchy:examples=update-requesty | update-requesty --force | update-requesty --resolve
+
+# Writes an agent usage record for Requesty into
+# ~/.local/state/omarchy/agents/usage/requesty.json, where the built-in
+# agents panel watches. Without a resolvable credential it exits silently so
+# the panel never grows a Requesty tab. A failed fetch leaves the previous
+# record in place, and the raw API responses are cached unless --force is set.
+#
+# Endpoints (Requesty management API, authenticated by the same key the router
+# uses; the key only needs permission to query itself):
+#   GET https://api-v2.requesty.ai/v1/manage/apikey/self
+#   GET https://api-v2.requesty.ai/v1/manage/apikey/self/usage?start=..&end=..&resolution=day&group_by=model_used
+#
+# Credential resolution, first hit wins:
+#   1. REQUESTY_API_KEY environment variable
+#   2. ~/.local/share/opencode/auth.json  ("requesty" entry, read-only)
+#   3. ~/.config/omarchy/api-keys.env (REQUESTY_API_KEY=..., parsed literally)
+
+set -euo pipefail
+
+API=https://api-v2.requesty.ai
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+MAX_AGE=300
+WINDOW_DAYS=30
+
+force=false
+mkdir -p "$CACHE_DIR" "$STATE_DIR"
+
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+usage() {
+  cat <<'USAGE'
+Usage: update-requesty [--force] [--resolve]
+
+  --force    Bypass the API response cache
+  --resolve  Print the resolved credential and exit
+USAGE
+}
+
+# ------------------------------------------------------- credential resolution
+
+key_from_env() {
+  [[ -n ${REQUESTY_API_KEY:-} ]] && { printf '%s' "$REQUESTY_API_KEY"; return 0; }
+  return 1
+}
+
+key_from_opencode() {
+  local auth="${OPENCODE_HOME:-$HOME/.local/share/opencode}/auth.json" k
+  [[ -f $auth ]] || return 0
+  k=$(jq -r '.requesty.key // empty' "$auth" 2>/dev/null || true)
+  [[ -n $k ]] && printf '%s' "$k"
+}
+
+key_from_file() {
+  local f="${OMARCHY_API_KEYS_FILE:-$HOME/.config/omarchy/api-keys.env}"
+  [[ -f $f ]] || return 1
+  local line
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    [[ $line == REQUESTY_API_KEY=* ]] || continue
+    printf '%s' "${line#REQUESTY_API_KEY=}"
+    return 0
+  done <"$f"
+  return 1
+}
+
+resolve_key() {
+  local k
+  k=$(key_from_env) && { printf '%s' "$k"; return 0; }
+  k=$(key_from_opencode) && { printf '%s' "$k"; return 0; }
+  k=$(key_from_file) && { printf '%s' "$k"; return 0; }
+  return 1
+}
+
+# ------------------------------------------------------------ fetch utilities
+
+cached_get() {
+  local url=$1 cachefile=$2 key=$3
+  if [[ -s $cachefile ]] && ! $force; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$cachefile" 2>/dev/null || echo 0) ))
+    if (( age < MAX_AGE )); then cat "$cachefile"; return 0; fi
+  fi
+  local payload
+  payload=$(curl -fsS --max-time 20 \
+    -H "Authorization: Bearer $key" -H 'Accept: application/json' "$url") || return 1
+  jq -e . >/dev/null 2>&1 <<<"$payload" || return 1
+  printf '%s' "$payload" >"$cachefile"
+  printf '%s' "$payload"
+}
+
+# -------------------------------------------------------------------- record
+
+build_record() {
+  local self=$1 usage=$2 today=$3 reset=$4 days=$5
+  jq -n --argjson self "$self" --argjson usage "$usage" \
+    --arg now "$now" --arg today "$today" --arg reset "$reset" --argjson days "$days" '
+    def n: if . == null then 0 else tonumber end;
+    ($self.monthly_limit // "0" | n) as $limit
+    | ($self.monthly_spend // "0" | n) as $spend
+    | ($usage.usage // {}) as $u
+    | (if $limit > 0 then ([$spend / $limit, 1] | min) else null end) as $ratio
+    | ($u[$today] // {}) as $t
+    | {
+        schemaVersion: 1,
+        id: "requesty",
+        name: "Requesty",
+        updatedAt: $now,
+        ready: true,
+        hasLocalStats: false,
+        hasPromptStats: false,
+        scope: "account",
+        tierLabel: "Pay as you go",
+        usageStatusText:
+          (if $limit > 0 then ""
+           else "$" + (($spend * 100 | round) / 100 | tostring) + " spent this month" end),
+        limits:
+          (if $limit > 0 then [{
+              label: "Monthly", title: "Monthly",
+              percent: (($ratio * 1000 | round) / 1000),
+              resetsAt: $reset,
+              status: (if $spend >= $limit then "exhausted" else "ok" end)
+            }] else [] end),
+        recentDays: [ $days[] as $d | { date: $d, messageCount: (($u[$d].total_tokens // 0) | n) } ],
+        modelUsage: (
+          [ $u[] | (.grouped_data // [])[]
+            | { model: .group_by_values.model_used,
+                input: (.input_tokens // 0 | n),
+                output: (.output_tokens // 0 | n) } ]
+          | map(select(.model != null))
+          | group_by(.model)
+          | map({ key: .[0].model,
+                  value: { inputTokens: (map(.input) | add // 0),
+                           outputTokens: (map(.output) | add // 0),
+                           cacheReadInputTokens: 0,
+                           cacheCreationInputTokens: 0 } })
+          | from_entries
+        ),
+        todayPrompts: ($t.completions_requests // 0 | n),
+        todaySessions: ($t.total_requests // 0 | n),
+        todayTotalTokens: ($t.total_tokens // 0 | n),
+        totalPrompts: ([ $u[].completions_requests // 0 | n ] | add // 0),
+        totalSessions: ([ $u[].total_requests // 0 | n ] | add // 0),
+        activeDates: ($u | keys),
+        activeDays: ($u | length)
+      }
+    + (if $limit > 0 then {
+        balance: {
+          remaining: (if ($limit - $spend) > 0 then ($limit - $spend) else 0 end),
+          funded: $limit,
+          spent: $spend,
+          currency: "USD"
+        }
+      } else {} end)'
+}
+
+write_record() {
+  local record=$1 dest=$2 tmp
+  tmp=$(mktemp "$STATE_DIR/.tmp.XXXXXX")
+  printf '%s\n' "$record" >"$tmp"
+  mv "$tmp" "$dest"
+}
+
+update_requesty() {
+  local key self usage record start end today reset days
+  key=$(resolve_key) || return 0
+
+  start=$(date -u -d "$WINDOW_DAYS days ago" +%Y-%m-%dT00:00:00Z)
+  end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  self=$(cached_get "$API/v1/manage/apikey/self" "$CACHE_DIR/requesty-self.json" "$key") || return 0
+  usage=$(cached_get \
+    "$API/v1/manage/apikey/self/usage?start=$start&end=$end&resolution=day&group_by=model_used" \
+    "$CACHE_DIR/requesty-usage.json" "$key") || return 0
+
+  today=$(date +%Y-%m-%d)
+  reset=$(date -u -d "$(date -u +%Y-%m-01) +1 month" +%Y-%m-%dT00:00:00Z)
+  days=$(for i in 6 5 4 3 2 1 0; do date -d "-$i day" +%Y-%m-%d; done | jq -R . | jq -s .)
+
+  record=$(build_record "$self" "$usage" "$today" "$reset" "$days") || return 0
+  write_record "$record" "$STATE_DIR/requesty.json"
+}
+
+# ----------------------------------------------------------------------- main
+
+case ${1:-} in
+  "") ;;
+  --force) force=true ;;
+  --resolve)
+    if k=$(resolve_key) && [[ -n $k ]]; then printf '%s\n' "$k"; exit 0; fi
+    echo "no credential resolved for 'requesty'" >&2
+    exit 1 ;;
+  -h | --help) usage; exit 0 ;;
+  *) usage >&2; exit 64 ;;
+esac
+
+update_requesty
