@@ -1,5 +1,8 @@
 # Requesty usage for Omarchy
 
+<img width="314" height="408.5" alt="image" src="https://github.com/user-attachments/assets/f47cb339-d34b-49df-8017-f2be8f5319d8" />
+
+
 A **service plugin** that enriches the built-in [Omarchy](https://omarchy.org)
 **Agents** panel with a **Requesty** tab. It ships no widget and no UI of its
 own: it only writes the usage record where the stock panel already looks, so
