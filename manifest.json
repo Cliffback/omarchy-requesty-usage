@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "cliffback.requesty",
   "name": "Requesty usage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Cliffback",
   "license": "MIT",
   "homepage": "https://github.com/Cliffback/omarchy-requesty-usage",
-  "description": "Enriches the built-in Omarchy Agents panel with a Requesty tab: pay-as-you-go spend, an optional monthly key-cap meter, and tokens by day and model from the Requesty management API. No widget, no UI of its own — the stock panel picks the tab up automatically.",
+  "description": "Enriches the built-in Omarchy Agents panel with a Requesty tab: credits left plus account-wide tokens by day and model, from the Requesty management API. No widget, no UI of its own — the stock panel picks the tab up automatically.",
   "kinds": ["service"],
   "keepLoaded": true,
   "entryPoints": {
@@ -14,7 +14,7 @@
   },
   "install": {
     "commands": [],
-    "notes": "`omarchy plugin add https://github.com/Cliffback/omarchy-requesty-usage.git --enable`, then make sure the service is listed in shell.json: { \"plugins\": [ { \"id\": \"cliffback.requesty\" } ] }. The tab appears in your existing Agents panel as soon as a credential is resolved — nothing else to configure, and the panel itself is never modified or duplicated."
+    "notes": "`omarchy plugin add https://github.com/Cliffback/omarchy-requesty-usage.git --enable`, then make sure the service is listed in shell.json: { \"plugins\": [ { \"id\": \"cliffback.requesty\" } ] }. Requires a Requesty API key with `manage: read` (see the README); the tab appears in your existing Agents panel as soon as a credential is resolved."
   },
   "uninstall": {
     "commands": [
@@ -22,7 +22,7 @@
     ],
     "optional": [
       "rm -f \"$HOME/.local/state/omarchy/agents/usage/requesty.json\"",
-      "rm -f \"$HOME/.cache/omarchy/requesty-self.json\"",
+      "rm -f \"$HOME/.cache/omarchy/requesty-org.json\"",
       "rm -f \"$HOME/.cache/omarchy/requesty-usage.json\""
     ],
     "notes": "Removing the service stops the refreshes and unloads the tab from the Agents panel on the next rescan. The commands above are documentation; run them manually for a spotless cleanup."

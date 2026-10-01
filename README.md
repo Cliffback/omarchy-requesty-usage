@@ -8,27 +8,25 @@ replaced, patched, or duplicated.
 
 The tab shows:
 
-- **Pay-as-you-go spend** for the current month.
-- **Monthly key-cap meter** when the key carries a spending limit (with the
-  reset anchored to the first of next month).
-- **Tokens by day** (last 7 days) and **tokens by model** (last 30 days).
+- **Credits left** — the organization's remaining balance, in the hero line.
+- **Tokens by day** (last 7 days) and **tokens by model** (last 30 days),
+  account-wide.
 
-Data comes from the Requesty management API, authenticated with the same key
-the router uses:
+Data comes from the Requesty management API:
 
 | Endpoint | What it provides |
 |---|---|
-| `GET https://api-v2.requesty.ai/v1/manage/apikey/self` | monthly spend and the key's monthly limit |
-| `GET https://api-v2.requesty.ai/v1/manage/apikey/self/usage?…&group_by=model_used` | per-day spend, tokens, and the per-model breakdown |
+| `GET https://api-v2.requesty.ai/v1/manage/org` | the organization's remaining balance |
+| `GET https://api-v2.requesty.ai/v1/manage/org/usage?…&group_by=model_used` | account-wide per-day spend, tokens, and the per-model breakdown |
 
-Without a resolvable credential the tab never appears. A failed fetch keeps the
-previous record visible until the next attempt succeeds.
+Both require a key with the **`manage: read`** permission. Without a resolvable
+credential the tab never appears; a failed fetch keeps the previous record
+visible until the next attempt succeeds.
 
 ## Requirements
 
 - Omarchy (Hyprland + omarchy-shell)
-- A Requesty API key reachable on this machine (an OpenAI-compatible router key
-  is enough — no management permission required)
+- A Requesty API key with **`manage: read`**, reachable on this machine
 
 ## Installation
 
@@ -50,34 +48,68 @@ every five minutes; force it with:
 omarchy-shell cliffback.requesty refresh
 ```
 
-## Credential resolution
+## Credential
 
-The key is resolved on every refresh — first hit wins:
+The plugin reads a single key from, in order:
 
 1. **`REQUESTY_API_KEY`** environment variable.
-2. **OpenCode's credential store** `~/.local/share/opencode/auth.json`, the
-   `requesty` entry (read-only).
-3. **Manual override file** `~/.config/omarchy/api-keys.env` — plain
-   `KEY=value` lines, parsed literally and never sourced:
+2. **`~/.config/omarchy/api-keys.env`** — plain `KEY=value` lines, parsed
+   literally (optional surrounding quotes are stripped), never sourced.
 
-   ```bash
-   install -m 600 /dev/null ~/.config/omarchy/api-keys.env
-   printf 'REQUESTY_API_KEY=%s\n' "rq-..." >> ~/.config/omarchy/api-keys.env
-   ```
+Do **not** wrap the value in quotes when it is the only line:
 
-Credential files are only ever read, never written, and the key is sent only to
-`api-v2.requesty.ai`.
+```bash
+install -m 600 /dev/null ~/.config/omarchy/api-keys.env
+printf 'REQUESTY_API_KEY=%s\n' 'rqs-...' >> ~/.config/omarchy/api-keys.env
+```
+
+The key is sent only to `api-v2.requesty.ai` and is never written anywhere else.
+
+### Minting a read-only key
+
+The Requesty console only offers an all-or-nothing **Admin** key
+(`manage: write`), which can create and delete keys org-wide. For a bar widget
+you want the least privilege that still reads the balance: **`manage: read`**.
+Mint one from a one-time Admin key with the [Requesty CLI](https://requesty.ai):
+
+```bash
+# 1. Console -> API Keys -> create a temporary key with the Admin permission.
+requesty login --api-key '<temp-admin>' --profile temp-admin
+
+# 2. The temp key's id (this is 'self'; works without manage permission):
+requesty --profile temp-admin api-keys show self --json        # note .id
+
+# 3. Create the read-only key (no id needed):
+requesty --profile temp-admin api-keys create \
+  --name omarchy-balance-read \
+  --manage-permission read --completions-permission none --json # note .api_key
+
+# 4. Store it (no quotes, file at 0600):
+printf 'REQUESTY_API_KEY=%s\n' '<read-only-key>' >> ~/.config/omarchy/api-keys.env
+
+# 5. Verify it can read the balance before discarding the admin key:
+curl -sS -H "Authorization: Bearer $(sed -n 's/^REQUESTY_API_KEY=//p' ~/.config/omarchy/api-keys.env)" \
+  https://api-v2.requesty.ai/v1/manage/org                   # -> {"name":...,"balance":...}
+
+# 6. Revoke the privileged key — this is temp-admin, NOT the read-only key:
+requesty --profile temp-admin api-keys delete '<temp-admin-id>' -y
+requesty profiles remove temp-admin
+```
+
+`requesty profiles remove` only forgets the profile locally; `api-keys delete`
+(or the console) revokes the key itself.
 
 ## Troubleshooting
 
-- **The tab never appears** — no credential resolved. Check what the resolver
-  finds, in the same order the service uses:
+- **The tab never appears** — no credential resolved, or it lacks `manage`.
+  Check both:
 
   ```bash
   bash ~/.config/omarchy/plugins/cliffback.requesty/scripts/update-requesty --resolve
+  curl -sS -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $REQUESTY_API_KEY" \
+    https://api-v2.requesty.ai/v1/manage/org   # 200 = good, 403 = no manage permission
   ```
-
-  Exit code 1 with "no credential resolved" means every tier missed.
 
 - **Numbers look stale** — a fetch failed and the previous record is kept on
   purpose; shell errors surface in `journalctl --user | grep -i requesty`.
@@ -98,7 +130,7 @@ cleanup:
 
 ```bash
 rm -f ~/.local/state/omarchy/agents/usage/requesty.json
-rm -f ~/.cache/omarchy/requesty-self.json ~/.cache/omarchy/requesty-usage.json
+rm -f ~/.cache/omarchy/requesty-org.json ~/.cache/omarchy/requesty-usage.json
 ```
 
 ## License

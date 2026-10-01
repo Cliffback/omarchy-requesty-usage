@@ -5,19 +5,22 @@
 
 # Writes an agent usage record for Requesty into
 # ~/.local/state/omarchy/agents/usage/requesty.json, where the built-in
-# agents panel watches. Without a resolvable credential it exits silently so
-# the panel never grows a Requesty tab. A failed fetch leaves the previous
-# record in place, and the raw API responses are cached unless --force is set.
+# agents panel watches. Without a credential it exits silently so the panel
+# never grows a Requesty tab. A failed fetch leaves the previous record in
+# place, and the raw API responses are cached unless --force is set.
 #
-# Endpoints (Requesty management API, authenticated by the same key the router
-# uses; the key only needs permission to query itself):
-#   GET https://api-v2.requesty.ai/v1/manage/apikey/self
-#   GET https://api-v2.requesty.ai/v1/manage/apikey/self/usage?start=..&end=..&resolution=day&group_by=model_used
+# The credential must be a Requesty key with `manage: read` permission; the
+# organization balance and account-wide usage are only readable with it. See
+# the README for how to mint one from a one-time Admin key.
+#
+# Endpoints (Requesty management API):
+#   GET https://api-v2.requesty.ai/v1/manage/org
+#   GET https://api-v2.requesty.ai/v1/manage/org/usage?start=..&end=..&resolution=day&group_by=model_used
 #
 # Credential resolution, first hit wins:
 #   1. REQUESTY_API_KEY environment variable
-#   2. ~/.local/share/opencode/auth.json  ("requesty" entry, read-only)
-#   3. ~/.config/omarchy/api-keys.env (REQUESTY_API_KEY=..., parsed literally)
+#   2. ~/.config/omarchy/api-keys.env (REQUESTY_API_KEY=..., parsed literally,
+#      with optional surrounding quotes stripped)
 
 set -euo pipefail
 
@@ -48,21 +51,17 @@ key_from_env() {
   return 1
 }
 
-key_from_opencode() {
-  local auth="${OPENCODE_HOME:-$HOME/.local/share/opencode}/auth.json" k
-  [[ -f $auth ]] || return 0
-  k=$(jq -r '.requesty.key // empty' "$auth" 2>/dev/null || true)
-  [[ -n $k ]] && printf '%s' "$k"
-}
-
 key_from_file() {
   local f="${OMARCHY_API_KEYS_FILE:-$HOME/.config/omarchy/api-keys.env}"
   [[ -f $f ]] || return 1
-  local line
+  local line v
   while IFS= read -r line; do
     line=${line%$'\r'}
     [[ $line == REQUESTY_API_KEY=* ]] || continue
-    printf '%s' "${line#REQUESTY_API_KEY=}"
+    v=${line#REQUESTY_API_KEY=}
+    v=${v%\"}; v=${v#\"}
+    v=${v%\'}; v=${v#\'}
+    printf '%s' "$v"
     return 0
   done <"$f"
   return 1
@@ -71,7 +70,6 @@ key_from_file() {
 resolve_key() {
   local k
   k=$(key_from_env) && { printf '%s' "$k"; return 0; }
-  k=$(key_from_opencode) && { printf '%s' "$k"; return 0; }
   k=$(key_from_file) && { printf '%s' "$k"; return 0; }
   return 1
 }
@@ -95,14 +93,17 @@ cached_get() {
 # -------------------------------------------------------------------- record
 
 build_record() {
-  local self=$1 usage=$2 today=$3 reset=$4 days=$5
-  jq -n --argjson self "$self" --argjson usage "$usage" \
-    --arg now "$now" --arg today "$today" --arg reset "$reset" --argjson days "$days" '
+  local org=$1 usage=$2 today=$3 days=$4
+  jq -n --argjson org "$org" --argjson usage "$usage" \
+    --arg now "$now" --arg today "$today" --argjson days "$days" '
     def n: if . == null then 0 else tonumber end;
-    ($self.monthly_limit // "0" | n) as $limit
-    | ($self.monthly_spend // "0" | n) as $spend
+    # Render a dollar figure with two decimals ("0" -> "0.00").
+    def money:
+      (. * 100 | round) as $c
+      | (($c / 100) | floor | tostring) + "."
+        + ((($c % 100) | tostring) | if length < 2 then ("0" + .) else . end);
+    ($org.balance // "0" | n) as $balance
     | ($usage.usage // {}) as $u
-    | (if $limit > 0 then ([$spend / $limit, 1] | min) else null end) as $ratio
     | ($u[$today] // {}) as $t
     | {
         schemaVersion: 1,
@@ -113,17 +114,10 @@ build_record() {
         hasLocalStats: false,
         hasPromptStats: false,
         scope: "account",
-        tierLabel: "Pay as you go",
-        usageStatusText:
-          (if $limit > 0 then ""
-           else "$" + (($spend * 100 | round) / 100 | tostring) + " spent this month" end),
-        limits:
-          (if $limit > 0 then [{
-              label: "Monthly", title: "Monthly",
-              percent: (($ratio * 1000 | round) / 1000),
-              resetsAt: $reset,
-              status: (if $spend >= $limit then "exhausted" else "ok" end)
-            }] else [] end),
+        # The stock panel has no relabelable credit row, so the figure rides in
+        # the hero line, which is the only free-form slot it renders.
+        tierLabel: ("Credits left: $" + ($balance | money)),
+        usageStatusText: "",
         recentDays: [ $days[] as $d | { date: $d, messageCount: (($u[$d].total_tokens // 0) | n) } ],
         modelUsage: (
           [ $u[] | (.grouped_data // [])[]
@@ -146,15 +140,7 @@ build_record() {
         totalSessions: ([ $u[].total_requests // 0 | n ] | add // 0),
         activeDates: ($u | keys),
         activeDays: ($u | length)
-      }
-    + (if $limit > 0 then {
-        balance: {
-          remaining: (if ($limit - $spend) > 0 then ($limit - $spend) else 0 end),
-          funded: $limit,
-          spent: $spend,
-          currency: "USD"
-        }
-      } else {} end)'
+      }'
 }
 
 write_record() {
@@ -165,22 +151,21 @@ write_record() {
 }
 
 update_requesty() {
-  local key self usage record start end today reset days
+  local key org usage record start end today days
   key=$(resolve_key) || return 0
 
   start=$(date -u -d "$WINDOW_DAYS days ago" +%Y-%m-%dT00:00:00Z)
   end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-  self=$(cached_get "$API/v1/manage/apikey/self" "$CACHE_DIR/requesty-self.json" "$key") || return 0
+  org=$(cached_get "$API/v1/manage/org" "$CACHE_DIR/requesty-org.json" "$key") || return 0
   usage=$(cached_get \
-    "$API/v1/manage/apikey/self/usage?start=$start&end=$end&resolution=day&group_by=model_used" \
+    "$API/v1/manage/org/usage?start=$start&end=$end&resolution=day&group_by=model_used" \
     "$CACHE_DIR/requesty-usage.json" "$key") || return 0
 
   today=$(date +%Y-%m-%d)
-  reset=$(date -u -d "$(date -u +%Y-%m-01) +1 month" +%Y-%m-%dT00:00:00Z)
   days=$(for i in 6 5 4 3 2 1 0; do date -d "-$i day" +%Y-%m-%d; done | jq -R . | jq -s .)
 
-  record=$(build_record "$self" "$usage" "$today" "$reset" "$days") || return 0
+  record=$(build_record "$org" "$usage" "$today" "$days") || return 0
   write_record "$record" "$STATE_DIR/requesty.json"
 }
 
